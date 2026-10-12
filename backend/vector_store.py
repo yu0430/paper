@@ -1,0 +1,221 @@
+import os
+import logging
+
+from langchain_classic.embeddings import CacheBackedEmbeddings
+from langchain_classic.storage import LocalFileStore
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers.bm25 import BM25Retriever
+from langchain_core.documents import Document
+from langchain_qdrant import QdrantVectorStore
+from langchain_cohere import CohereRerank
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+
+from backend.model_config import create_embedding_model, settings
+
+logger = logging.getLogger(__name__)
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+EMBEDDING_DIM = settings.embedding_dim
+
+# ── Singletons ────────────────────────────────────────────────────────────────
+
+base_embeddings = create_embedding_model()
+data_dir = os.environ.get("PAPEER_DATA_DIR", ".")
+embedding_file_store = LocalFileStore(os.path.join(data_dir, "embedding_cache"))
+embeddings = CacheBackedEmbeddings.from_bytes_store(
+    base_embeddings,
+    embedding_file_store,
+    namespace=f"{settings.qwen_embedding_model}-{EMBEDDING_DIM}",
+    query_embedding_cache=True,
+    key_encoder="blake2b",
+)
+
+qdrant_client = QdrantClient(
+    url=os.environ["QDRANT_URL"],
+    api_key=os.environ["QDRANT_API_KEY"],
+    timeout=120,
+)
+
+
+# ── Collection ───────────────────────────────────────────────────────────────
+
+def get_collection_name(session_id: str) -> str:
+    return f"papeer_{session_id.replace('-', '_')}"
+
+
+def get_vectorstore(session_id: str) -> QdrantVectorStore:
+    collection_name = get_collection_name(session_id)
+    if not qdrant_client.collection_exists(collection_name):
+        qdrant_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        )
+        from qdrant_client.models import PayloadSchemaType
+        try:
+            qdrant_client.create_payload_index(
+                collection_name=collection_name,
+                field_name="metadata.title",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass
+    return QdrantVectorStore(
+        client=qdrant_client,
+        collection_name=collection_name,
+        embedding=embeddings,
+    )
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+def add_paper(docs: list[Document], session_id: str) -> None:
+    get_vectorstore(session_id).add_documents(docs)
+
+
+def list_papers(session_id: str) -> list[str]:
+    collection_name = get_collection_name(session_id)
+    if not qdrant_client.collection_exists(collection_name):
+        return []
+    seen: set[str] = set()
+    titles: list[str] = []
+    offset = None
+    while True:
+        points, offset = qdrant_client.scroll(
+            collection_name=collection_name,
+            with_payload=True,
+            limit=100,
+            offset=offset,
+        )
+        for point in points:
+            title = (point.payload or {}).get("metadata", {}).get("title")
+            if title and title not in seen:
+                seen.add(title)
+                titles.append(title)
+        if offset is None:
+            break
+    return titles
+
+
+def delete_paper(title: str, session_id: str) -> None:
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, PayloadSchemaType
+    collection_name = get_collection_name(session_id)
+    if not qdrant_client.collection_exists(collection_name):
+        return
+    # Ensure payload index exists on metadata.title for existing collections
+    try:
+        qdrant_client.create_payload_index(
+            collection_name=collection_name,
+            field_name="metadata.title",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+    except Exception:
+        pass
+    qdrant_client.delete(
+        collection_name=collection_name,
+        points_selector=Filter(
+            must=[
+                FieldCondition(
+                    key="metadata.title",
+                    match=MatchValue(value=title)
+                )
+            ]
+        )
+    )
+
+
+def delete_session_collection(session_id: str) -> None:
+    collection_name = get_collection_name(session_id)
+    if qdrant_client.collection_exists(collection_name):
+        qdrant_client.delete_collection(collection_name)
+
+
+def get_all_documents(session_id: str) -> list[Document]:
+    collection_name = get_collection_name(session_id)
+    if not qdrant_client.collection_exists(collection_name):
+        return []
+    docs = []
+    offset = None
+    while True:
+        points, offset = qdrant_client.scroll(
+            collection_name=collection_name,
+            with_payload=True,
+            limit=100,
+            offset=offset,
+        )
+        for point in points:
+            payload = point.payload or {}
+            page_content = payload.get("page_content", "")
+            metadata = payload.get("metadata", {})
+            docs.append(Document(page_content=page_content, metadata=metadata))
+        if offset is None:
+            break
+    return docs
+
+
+def get_hybrid_retriever(session_id: str, k: int = 4):
+    collection_name = get_collection_name(session_id)
+    if not qdrant_client.collection_exists(collection_name):
+        return None
+
+    dense_vectorstore = get_vectorstore(session_id)
+    dense_retriever = dense_vectorstore.as_retriever(search_kwargs={"k": k})
+
+    docs = get_all_documents(session_id)
+    if not docs:
+        return dense_retriever
+
+    sparse_retriever = BM25Retriever.from_documents(docs)
+    sparse_retriever.k = k
+
+    # Combine dense and sparse retrievers (0.7 dense / 0.3 sparse)
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[dense_retriever, sparse_retriever],
+        weights=[0.7, 0.3],
+    )
+    return ensemble_retriever
+
+
+def search(query: str, session_id: str, k: int = 4) -> tuple[list[Document], str]:
+    # Retrieve a larger candidate pool for reranking (e.g. 3 * k, at least 12 docs)
+    candidate_k = max(k * 3, 12)
+    retriever = get_hybrid_retriever(session_id, k=candidate_k)
+    if not retriever:
+        return [], "No active retriever found."
+    
+    candidates = retriever.invoke(query)
+    if not candidates:
+        return [], "No search results found in knowledge base."
+
+    cohere_api_key = os.getenv("COHERE_API_KEY")
+    if not cohere_api_key:
+        msg = "COHERE_API_KEY not configured. Returning top raw hybrid retrieval results."
+        logger.warning(msg)
+        return candidates[:k], msg
+
+    try:
+        reranker = CohereRerank(
+            model="rerank-english-v3.0",
+            cohere_api_key=cohere_api_key,
+            top_n=k
+        )
+        reranked_docs = reranker.compress_documents(candidates, query)
+        
+        details = []
+        for idx, doc in enumerate(reranked_docs, 1):
+            score = doc.metadata.get("relevance_score")
+            title = doc.metadata.get("title", "Unknown")
+            page = doc.metadata.get("page", 0) + 1  # 0-indexed page to 1-indexed for user readability
+            score_str = f"{score:.4f}" if score is not None else "N/A"
+            details.append(f"Rank {idx}: [Score {score_str}] {title} (Page {page})")
+            
+        msg = f"Successfully reranked {len(candidates)} down to {len(reranked_docs)} using Cohere (Model: rerank-english-v3.0). Details: {'; '.join(details)}"
+        logger.info(msg)
+        print(f"\n[COHERE RERANK SUCCESS] {msg}\n")
+        return reranked_docs, msg
+    except Exception as e:
+        msg = f"Cohere Rerank failed: {e}. Falling back to top raw hybrid retrieval (Ranker Cohere `rerank-english-v3.0` bypassed)."
+        logger.error(msg)
+        print(f"\n[COHERE RERANK ERROR] {msg}\n")
+        return candidates[:k], msg
